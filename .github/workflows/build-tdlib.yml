@@ -1,0 +1,187 @@
+name: Build TDLib for Android
+
+# 手动触发，或当 tdlib.version 变化时触发
+# 产物: tdlib-android.zip
+#   ├─ jniLibs/<abi>/libtdjni.so   (每个ABI一份)
+#   └─ java/org/drinkless/tdlib/*.java  (TDLib 自动生成的 Java API, Client.java / TdApi.java)
+#
+# app 模块通过 scripts/fetch-tdlib.sh 下载并解压这个 artifact 到:
+#   app/src/main/jniLibs/
+#   app/src/main/java/  (生成的 org.drinkless.tdlib 包)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tdlib_ref:
+        description: "TDLib git tag/commit"
+        required: true
+        default: "fd3154b28727df9e66423d64168fab1202d8c849"
+  push:
+    branches:
+      - main
+
+env:
+  ANDROID_NDK_VERSION: "r26d"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ninja-build zlib1g-dev libssl-dev gperf php-cli
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Checkout TDLib
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/td
+          ref: ${{ github.event.inputs.tdlib_ref || 'fd3154b28727df9e66423d64168fab1202d8c849' }}
+          path: td
+
+      - name: Pre-generate TDLib auto source files (native, before cross-compile)
+        working-directory: td
+        run: |
+          # 参考 Nagram (TMessagesProj/jni/tde2e/build-tdlib.sh) 的实际做法：
+          # native阶段要 `cmake --build .`（不指定target，构建全部），
+          # 只build `prepare_cross_compiling` 这一个子target是不够的——
+          # td_jni.cpp 依赖的 td::td_api::Object::fetch / Function::fetch
+          # 等TL转C++代码，是由另一批生成目标产出的，必须全量构建一次才会触发。
+          mkdir -p build-pregenerate
+          cd build-pregenerate
+          cmake -DCMAKE_BUILD_TYPE=Release -DTD_GENERATE_SOURCE_FILES=ON -DTD_ENABLE_JNI=ON -GNinja ..
+          cmake --build . -- -j$(nproc)   
+
+      - name: Map ABI to OpenSSL target & install dir
+        id: openssl_meta
+        run: |
+          case "${{ matrix.abi }}" in
+            arm64-v8a)   echo "target=android-arm64" >> $GITHUB_OUTPUT ;;
+            armeabi-v7a) echo "target=android-arm"   >> $GITHUB_OUTPUT ;;
+            x86_64)      echo "target=android-x86_64">> $GITHUB_OUTPUT ;;
+            x86)         echo "target=android-x86"   >> $GITHUB_OUTPUT ;;
+          esac
+          echo "install_dir=$GITHUB_WORKSPACE/openssl-install/${{ matrix.abi }}" >> $GITHUB_OUTPUT
+
+      - name: Build static OpenSSL for ${{ matrix.abi }}
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          curl -LO https://www.openssl.org/source/openssl-3.2.1.tar.gz
+          tar xf openssl-3.2.1.tar.gz
+          cd openssl-3.2.1
+
+          TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+
+          ./Configure ${{ steps.openssl_meta.outputs.target }} -D__ANDROID_API__=21 \
+              no-shared no-tests \
+              --prefix=${{ steps.openssl_meta.outputs.install_dir }}
+
+          make -j$(nproc)
+          make install_sw
+          echo "---- installed files ----"
+          find ${{ steps.openssl_meta.outputs.install_dir }} -maxdepth 3
+
+      - name: Configure & build tdjni (${{ matrix.abi }})
+        working-directory: td/example/android
+        run: |
+          mkdir -p build-${{ matrix.abi }}
+          cd build-${{ matrix.abi }}
+          OSSL=${{ steps.openssl_meta.outputs.install_dir }}
+          # 注意: tdjni 这个target定义在 example/android/CMakeLists.txt 里，
+          # 不在TDLib根目录的CMakeLists.txt里，所以要对这个子项目单独跑cmake，
+          # 而不是对td根目录跑（根目录只是被它add_subdirectory进来）。
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=${{ matrix.abi }} \
+                -DANDROID_PLATFORM=android-21 \
+                -DTD_ENABLE_JNI=ON \
+                -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+                -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+                -DOPENSSL_ROOT_DIR=$OSSL \
+                -DOPENSSL_INCLUDE_DIR=$OSSL/include \
+                -DOPENSSL_CRYPTO_LIBRARY=$OSSL/lib/libcrypto.a \
+                -DOPENSSL_SSL_LIBRARY=$OSSL/lib/libssl.a \
+                -DOPENSSL_USE_STATIC_LIBS=TRUE \
+                -GNinja \
+                ..
+          cmake --build . --target tdjni -- -j$(nproc)
+
+      - name: Generate Java API (once, arch-independent, native host build)
+        if: matrix.abi == 'arm64-v8a'
+        working-directory: td/example/android
+        run: |
+          # 关键修正: 生成 TdApi.java 的target叫 tl_generate_java，
+          # 定义在 example/android/CMakeLists.txt 的"非交叉编译"分支里，
+          # 不是 td 根目录的 td_generate_java_api（那个是给 example/java 用的、
+          # 依赖一套已装配的"td/bin"布局，跟我们的构建方式对不上）。
+          # 这里必须原生(host)构建 example/android 这个子项目本身，
+          # 它会自己 add_subdirectory(td) 把整个TDLib也编一遍(仅host态)。
+          mkdir -p build-java-native
+          cd build-java-native
+          cmake -DCMAKE_BUILD_TYPE=Release -GNinja ..
+          cmake --build . --target tl_generate_java -- -j$(nproc)
+          echo "---- 生成结果 ----"
+          ls -la ../org/drinkless/tdlib/
+          mkdir -p ../../../../java-out/org/drinkless/tdlib
+          cp ../org/drinkless/tdlib/TdApi.java ../../../../java-out/org/drinkless/tdlib/
+          cp ../../java/org/drinkless/tdlib/Client.java ../../../../java-out/org/drinkless/tdlib/
+
+      - name: Collect .so
+        run: |
+          mkdir -p out/jniLibs/${{ matrix.abi }}
+          find td/example/android/build-${{ matrix.abi }} -name "libtdjni.so" -exec cp {} out/jniLibs/${{ matrix.abi }}/ \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-${{ matrix.abi }}
+          path: out/jniLibs/${{ matrix.abi }}/libtdjni.so
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.abi == 'arm64-v8a'
+        with:
+          name: tdlib-java-api
+          path: java-out
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble tdlib-android.zip
+        run: |
+          mkdir -p dist/jniLibs dist/java
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            mkdir -p dist/jniLibs/$abi
+            cp artifacts/tdlib-$abi/libtdjni.so dist/jniLibs/$abi/ || true
+          done
+          cp -r artifacts/tdlib-java-api/* dist/java/
+          cd dist && zip -r ../tdlib-android.zip jniLibs java
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-android
+          path: tdlib-android.zip
+
+      - name: Attach to release (if tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tdlib-android.zip
