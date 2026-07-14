@@ -15,7 +15,8 @@ on:
       tdlib_ref:
         description: "TDLib git tag/commit"
         required: true
-        default: "fd3154b28727df9e66423d64168fab1202d8c849"
+        #default: "fd3154b28727df9e66423d64168fab1202d8c849"
+        default: "a17f87c4cff7b90b278d12b91ba0614383aaee82"
   push:
     branches:
       - main
