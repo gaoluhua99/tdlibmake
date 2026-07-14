@@ -1,135 +1,198 @@
 name: Check TDLib Upstream Updates
 
-# 每天 UTC 08:00 自动检查 tdlib/td 是否有新 tag
-# 若发现新版本且与当前 tdlib.version 不同，则自动提 PR 更新
+# 跟踪 tdlib/td 的 CMakeLists.txt 中的 project(TDLib VERSION x.x.x)
+# 这是 tdlib 官方维护的语义版本号，比 tag 更新更频繁。
+# 同时记录对应的 commit SHA，供编译时精确 checkout。
+#
+# 工作流程:
+#   1. 每天 UTC 08:00 自动运行（也支持手动触发）
+#   2. 读取 tdlib/td master 的 CMakeLists.txt，提取版本号 + HEAD SHA
+#   3. 与本仓库 tdlib.version 文件对比（格式: "<SHA> # v<VERSION>"）
+#   4. 若有更新，自动创建 PR
 
 on:
   schedule:
-    - cron: "0 8 * * *"   # 每天 UTC 08:00
-  workflow_dispatch:        # 也支持手动触发
+    - cron: "0 8 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
+
+env:
+  TDLIB_REPO: "tdlib/td"
+  TDLIB_BRANCH: "master"
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch latest tdlib/td tag
+      - name: Fetch tdlib/td version from CMakeLists.txt
         id: upstream
         run: |
-          # 获取 tdlib/td 所有 tag，找出最新的 v* 版本 tag
-          LATEST_TAG=$(git ls-remote --tags https://github.com/tdlib/td \
-            | grep -Eo 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sed 's|refs/tags/||' \
-            | sort -V \
-            | tail -1)
+          # 获取 master 分支的 HEAD SHA
+          HEAD_SHA=$(git ls-remote https://github.com/${{ env.TDLIB_REPO }}.git \
+            refs/heads/${{ env.TDLIB_BRANCH }} | cut -f1)
 
-          # 若无版本 tag，则取最新 commit SHA（main 分支）
-          if [ -z "$LATEST_TAG" ]; then
-            LATEST_TAG=$(git ls-remote https://github.com/tdlib/td HEAD | cut -f1)
-            echo "ℹ️  未找到版本 tag，使用最新 HEAD SHA: ${LATEST_TAG}"
+          if [ -z "$HEAD_SHA" ]; then
+            echo "ERROR: Failed to fetch HEAD SHA"
+            exit 1
           fi
 
-          echo "latest=${LATEST_TAG}" >> $GITHUB_OUTPUT
-          echo "🔍 tdlib/td 最新版本: ${LATEST_TAG}"
+          # 读取 CMakeLists.txt，提取版本号
+          # 格式: project(TDLib VERSION 1.8.65 LANGUAGES CXX C)
+          CMAKE_URL="https://raw.githubusercontent.com/${{ env.TDLIB_REPO }}/${HEAD_SHA}/CMakeLists.txt"
+          CMAKE_CONTENT=$(curl -fsSL "$CMAKE_URL")
+
+          VERSION=$(echo "$CMAKE_CONTENT" \
+            | grep -oP 'project\s*\(\s*TDLib\s+VERSION\s+\K[0-9]+\.[0-9]+\.[0-9]+')
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not extract version from CMakeLists.txt"
+            exit 1
+          fi
+
+          echo "sha=${HEAD_SHA}"          >> $GITHUB_OUTPUT
+          echo "sha_short=${HEAD_SHA:0:7}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"        >> $GITHUB_OUTPUT
+
+          echo "Upstream tdlib/td master:"
+          echo "  VERSION : ${VERSION}"
+          echo "  HEAD SHA: ${HEAD_SHA}"
 
       - name: Read current tdlib.version
         id: current
         run: |
           if [ -f "tdlib.version" ]; then
-            CURRENT="$(cat tdlib.version | tr -d '[:space:]')"
+            RAW="$(cat tdlib.version | tr -d '\r')"
+            # 兼容两种格式:
+            #   旧格式: 纯 SHA（40位）
+            #   新格式: "<SHA> # v<VERSION>"
+            CURRENT_SHA=$(echo "$RAW" | awk '{print $1}')
+            CURRENT_VER=$(echo "$RAW" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
           else
-            CURRENT=""
+            CURRENT_SHA=""
+            CURRENT_VER=""
           fi
-          echo "version=${CURRENT}" >> $GITHUB_OUTPUT
-          echo "📄 当前 tdlib.version: ${CURRENT}"
+          echo "sha=${CURRENT_SHA}"     >> $GITHUB_OUTPUT
+          echo "version=${CURRENT_VER}" >> $GITHUB_OUTPUT
+          echo "Current tdlib.version: sha=${CURRENT_SHA:0:7} version=${CURRENT_VER:-<unknown>}"
 
-      - name: Compare versions
+      - name: Compare
         id: compare
         run: |
-          LATEST="${{ steps.upstream.outputs.latest }}"
-          CURRENT="${{ steps.current.outputs.version }}"
+          LATEST_SHA="${{ steps.upstream.outputs.sha }}"
+          LATEST_VER="${{ steps.upstream.outputs.version }}"
+          CURRENT_SHA="${{ steps.current.outputs.sha }}"
+          CURRENT_VER="${{ steps.current.outputs.version }}"
 
-          if [ "$LATEST" = "$CURRENT" ]; then
-            echo "✅ 已是最新版本 (${CURRENT})，无需更新"
+          if [ "$LATEST_SHA" = "$CURRENT_SHA" ]; then
+            echo "Already up to date: v${CURRENT_VER} (${CURRENT_SHA:0:7})"
             echo "needs_update=false" >> $GITHUB_OUTPUT
           else
-            echo "🆕 发现新版本: ${CURRENT} → ${LATEST}"
+            echo "Update available:"
+            echo "  ${CURRENT_VER:-unknown} (${CURRENT_SHA:0:7}) -> ${LATEST_VER} (${LATEST_SHA:0:7})"
             echo "needs_update=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Update tdlib.version and open PR
         if: steps.compare.outputs.needs_update == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          LATEST="${{ steps.upstream.outputs.latest }}"
-          CURRENT="${{ steps.current.outputs.version }}"
-          BRANCH="update/tdlib-${LATEST}"
+          LATEST_SHA="${{ steps.upstream.outputs.sha }}"
+          LATEST_SHORT="${{ steps.upstream.outputs.sha_short }}"
+          LATEST_VER="${{ steps.upstream.outputs.version }}"
+          CURRENT_SHA="${{ steps.current.outputs.sha }}"
+          CURRENT_VER="${{ steps.current.outputs.version }}"
+          BRANCH="update/tdlib-v${LATEST_VER}"
 
+          git remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 若该分支已存在（上次 PR 未合并）则先删除
           git push origin --delete "${BRANCH}" 2>/dev/null || true
           git checkout -b "${BRANCH}"
 
-          echo "${LATEST}" > tdlib.version
+          # 新格式：SHA 后附版本号注释，方便人工查看
+          echo "${LATEST_SHA} # v${LATEST_VER}" > tdlib.version
           git add tdlib.version
-          git commit -m "chore: bump tdlib to ${LATEST}
 
-          Previous: ${CURRENT}
-          Latest  : ${LATEST}
+          git commit -m "chore: bump tdlib to v${LATEST_VER}
 
+          Previous: v${CURRENT_VER} (${CURRENT_SHA:0:7})
+          Latest  : v${LATEST_VER} (${LATEST_SHA:0:7})
+
+          Source: tdlib/td master CMakeLists.txt
           Auto-generated by check-tdlib-update workflow."
 
           git push origin "${BRANCH}"
 
-          # 创建 PR
-          gh pr create \
-            --title "chore: bump tdlib to ${LATEST}" \
-            --body "## 自动检测到 TDLib 上游更新
+          EXISTING_PR=$(gh pr list \
+            --head "${BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
 
-          | 字段 | 值 |
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists, skipping"
+          else
+            DIFF_URL="https://github.com/tdlib/td/compare/${CURRENT_SHA}...${LATEST_SHA}"
+
+            cat > /tmp/pr-body.md << PREOF
+          ## TDLib v${LATEST_VER}
+
+          | Field | Value |
           |---|---|
-          | 当前版本 | \`${CURRENT}\` |
-          | 最新版本 | \`${LATEST}\` |
-          | 上游链接 | https://github.com/tdlib/td/releases/tag/${LATEST} |
+          | Previous | v${CURRENT_VER} [\`${CURRENT_SHA:0:7}\`](https://github.com/tdlib/td/commit/${CURRENT_SHA}) |
+          | Latest   | v${LATEST_VER} [\`${LATEST_SHORT}\`](https://github.com/tdlib/td/commit/${LATEST_SHA}) |
+          | Diff     | [Compare ${CURRENT_SHA:0:7}...${LATEST_SHORT}](${DIFF_URL}) |
 
-          ### 变更内容
-          请查看 [tdlib/td 更新日志](https://github.com/tdlib/td/blob/${LATEST}/CHANGELOG.md) 确认兼容性后合并此 PR。
-
-          合并后，推送 tag 即可触发编译：
+          ### Before merging
+          1. Review the [diff](${DIFF_URL}) for breaking changes
+          2. Merge this PR
+          3. Push a release tag to trigger the build:
           \`\`\`bash
-          git tag v<your-version>
-          git push origin v<your-version>
+          git tag v${LATEST_VER}
+          git push origin v${LATEST_VER}
           \`\`\`
 
-          > 此 PR 由 [check-tdlib-update](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow 自动生成。" \
-            --base main \
-            --head "${BRANCH}" \
-            --label "dependencies,automated"
+          > Auto-generated by [check-tdlib-update](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          PREOF
 
-          echo "✅ PR 已创建: ${BRANCH}"
+            gh pr create \
+              --title "chore: bump tdlib to v${LATEST_VER}" \
+              --body-file /tmp/pr-body.md \
+              --base main \
+              --head "${BRANCH}"
+            echo "PR created: bump to v${LATEST_VER}"
+          fi
 
       - name: Post summary
+        if: always()
         run: |
-          LATEST="${{ steps.upstream.outputs.latest }}"
-          CURRENT="${{ steps.current.outputs.version }}"
+          LATEST_SHA="${{ steps.upstream.outputs.sha }}"
+          LATEST_VER="${{ steps.upstream.outputs.version }}"
+          CURRENT_SHA="${{ steps.current.outputs.sha }}"
+          CURRENT_VER="${{ steps.current.outputs.version }}"
           NEEDS_UPDATE="${{ steps.compare.outputs.needs_update }}"
 
-          echo "## TDLib 版本检查结果" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 字段 | 值 |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| 当前 tdlib.version | \`${CURRENT}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 上游最新 tag       | \`${LATEST}\` |" >> $GITHUB_STEP_SUMMARY
-          if [ "$NEEDS_UPDATE" = "true" ]; then
-            echo "| 状态 | 🆕 已自动创建更新 PR |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| 状态 | ✅ 已是最新版本 |" >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## TDLib Version Check"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Current  | v${CURRENT_VER:-unknown} (\`${CURRENT_SHA:0:7}\`) |"
+            echo "| Upstream | v${LATEST_VER} (\`${LATEST_SHA:0:7}\`) |"
+            if [ "$NEEDS_UPDATE" = "true" ]; then
+              echo "| Status | New version — PR created |"
+              echo "| Diff | [Compare](https://github.com/tdlib/td/compare/${CURRENT_SHA}...${LATEST_SHA}) |"
+            else
+              echo "| Status | Already up to date |"
+            fi
+          } >> $GITHUB_STEP_SUMMARY

@@ -73,7 +73,10 @@ jobs:
             TDLIB_REF="${{ github.event.inputs.tdlib_ref }}"
           else
             if [ -f "tdlib.version" ]; then
-              TDLIB_REF="$(cat tdlib.version | tr -d '[:space:]')"
+              # 支持两种格式:
+              #   旧格式: 纯 SHA（40位）
+              #   新格式: "<SHA> # v<VERSION>"  ← check-tdlib-update 写入的格式
+              TDLIB_REF="$(cat tdlib.version | tr -d '\r' | awk '{print $1}')"
               echo "📄 从 tdlib.version 读取: ${TDLIB_REF}"
             else
               TDLIB_REF="${DEFAULT_TDLIB_REF}"
