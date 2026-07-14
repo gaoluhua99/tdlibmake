@@ -1,33 +1,98 @@
 name: Build TDLib for Android
 
-# 手动触发，或当 tdlib.version 变化时触发
-# 产物: tdlib-android.zip
+# 手动触发，或推送 tag（如 v1.8.0）时自动触发
+# 产物: tdlib-android-<version>.zip
 #   ├─ jniLibs/<abi>/libtdjni.so   (每个ABI一份)
-#   └─ java/org/drinkless/tdlib/*.java  (TDLib 自动生成的 Java API, Client.java / TdApi.java)
+#   └─ java/org/drinkless/tdlib/*.java  (TDLib 自动生成的 Java API)
 #
-# app 模块通过 scripts/fetch-tdlib.sh 下载并解压这个 artifact 到:
-#   app/src/main/jniLibs/
-#   app/src/main/java/  (生成的 org.drinkless.tdlib 包)
+# Release 发布规则:
+#   - 推送 tag (refs/tags/v*) → 自动创建 Release 并上传
+#   - 手动触发(workflow_dispatch) → 同样创建/更新 Release 并上传
 
 on:
   workflow_dispatch:
     inputs:
       tdlib_ref:
-        description: "TDLib git tag/commit"
+        description: "TDLib git tag/commit (e.g. v1.8.0 or commit SHA)"
         required: true
-        #default: "fd3154b28727df9e66423d64168fab1202d8c849"
         default: "a17f87c4cff7b90b278d12b91ba0614383aaee82"
+      release_tag:
+        description: "Release tag name (e.g. v1.8.0). Leave empty to use tdlib_ref as tag."
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
-    branches:
-      - main
+    tags:
+      - "v*"          # 推送任意 v* tag 时触发，如 v1.8.0、v1.8.0-rc1
 
 env:
   ANDROID_NDK_VERSION: "r26d"
 
 jobs:
-  build:
+  # ─────────────────────────────────────────────
+  # 解析版本信息，供后续 job 共享
+  # ─────────────────────────────────────────────
+  prepare:
     runs-on: ubuntu-latest
-    #runs-on: self-hosted
+    outputs:
+      tdlib_ref: ${{ steps.meta.outputs.tdlib_ref }}
+      version:   ${{ steps.meta.outputs.version }}
+      tag_name:  ${{ steps.meta.outputs.tag_name }}
+      zip_name:  ${{ steps.meta.outputs.zip_name }}
+    steps:
+      - name: Resolve version metadata
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # tag push: refs/tags/v1.8.0  →  TAG=v1.8.0
+            TAG="${GITHUB_REF#refs/tags/}"
+            # tdlib_ref 默认与 tag 同名；如 tag 是项目自身版本则沿用默认 commit
+            TDLIB_REF="${TAG}"
+            VERSION="${TAG}"
+          else
+            # workflow_dispatch
+            TDLIB_REF="${{ github.event.inputs.tdlib_ref }}"
+            if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+              TAG="${{ github.event.inputs.release_tag }}"
+            else
+              # 用 tdlib_ref 做 tag；如果是完整 SHA 则截短
+              RAW="${{ github.event.inputs.tdlib_ref }}"
+              if echo "$RAW" | grep -qE '^[0-9a-f]{40}$'; then
+                TAG="tdlib-${RAW:0:8}"
+              else
+                TAG="$RAW"
+              fi
+            fi
+            VERSION="$TAG"
+          fi
+
+          # 确保 version 以 v 开头（仅用于显示/文件名）
+          DISPLAY_VER="${VERSION#v}"        # 去掉前缀 v，纯数字/字符串
+          ZIP_NAME="tdlib-android-${VERSION}.zip"
+
+          echo "tdlib_ref=${TDLIB_REF}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"     >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG}"        >> $GITHUB_OUTPUT
+          echo "zip_name=${ZIP_NAME}"   >> $GITHUB_OUTPUT
+
+          echo "📦 tdlib_ref  : ${TDLIB_REF}"
+          echo "📦 version    : ${VERSION}"
+          echo "📦 tag_name   : ${TAG}"
+          echo "📦 zip_name   : ${ZIP_NAME}"
+
+  # ─────────────────────────────────────────────
+  # 按 ABI 并行编译 libtdjni.so
+  # ─────────────────────────────────────────────
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
@@ -49,30 +114,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: tdlib/td
-          ref: ${{ github.event.inputs.tdlib_ref || 'fd3154b28727df9e66423d64168fab1202d8c849' }}
+          ref: ${{ needs.prepare.outputs.tdlib_ref }}
           path: td
 
-      - name: Pre-generate TDLib auto source files (native, before cross-compile)
+      - name: Pre-generate TDLib auto source files (native host build)
         working-directory: td
         run: |
-          # 参考 Nagram (TMessagesProj/jni/tde2e/build-tdlib.sh) 的实际做法：
-          # native阶段要 `cmake --build .`（不指定target，构建全部），
-          # 只build `prepare_cross_compiling` 这一个子target是不够的——
-          # td_jni.cpp 依赖的 td::td_api::Object::fetch / Function::fetch
-          # 等TL转C++代码，是由另一批生成目标产出的，必须全量构建一次才会触发。
           mkdir -p build-pregenerate
           cd build-pregenerate
           cmake -DCMAKE_BUILD_TYPE=Release -DTD_GENERATE_SOURCE_FILES=ON -DTD_ENABLE_JNI=ON -GNinja ..
-          cmake --build . -- -j$(nproc)   
+          cmake --build . -- -j$(nproc)
 
-      - name: Map ABI to OpenSSL target & install dir
+      - name: Map ABI to OpenSSL target
         id: openssl_meta
         run: |
           case "${{ matrix.abi }}" in
-            arm64-v8a)   echo "target=android-arm64" >> $GITHUB_OUTPUT ;;
-            armeabi-v7a) echo "target=android-arm"   >> $GITHUB_OUTPUT ;;
-            x86_64)      echo "target=android-x86_64">> $GITHUB_OUTPUT ;;
-            x86)         echo "target=android-x86"   >> $GITHUB_OUTPUT ;;
+            arm64-v8a)   echo "target=android-arm64"  >> $GITHUB_OUTPUT ;;
+            armeabi-v7a) echo "target=android-arm"    >> $GITHUB_OUTPUT ;;
+            x86_64)      echo "target=android-x86_64" >> $GITHUB_OUTPUT ;;
+            x86)         echo "target=android-x86"    >> $GITHUB_OUTPUT ;;
           esac
           echo "install_dir=$GITHUB_WORKSPACE/openssl-install/${{ matrix.abi }}" >> $GITHUB_OUTPUT
 
@@ -91,21 +151,15 @@ jobs:
           ./Configure ${{ steps.openssl_meta.outputs.target }} -D__ANDROID_API__=21 \
               no-shared no-tests \
               --prefix=${{ steps.openssl_meta.outputs.install_dir }}
-
           make -j$(nproc)
           make install_sw
-          echo "---- installed files ----"
-          find ${{ steps.openssl_meta.outputs.install_dir }} -maxdepth 3
 
-      - name: Configure & build tdjni (${{ matrix.abi }})
+      - name: Configure & build libtdjni (${{ matrix.abi }})
         working-directory: td/example/android
         run: |
           mkdir -p build-${{ matrix.abi }}
           cd build-${{ matrix.abi }}
           OSSL=${{ steps.openssl_meta.outputs.install_dir }}
-          # 注意: tdjni 这个target定义在 example/android/CMakeLists.txt 里，
-          # 不在TDLib根目录的CMakeLists.txt里，所以要对这个子项目单独跑cmake，
-          # 而不是对td根目录跑（根目录只是被它add_subdirectory进来）。
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
                 -DANDROID_ABI=${{ matrix.abi }} \
@@ -122,30 +176,25 @@ jobs:
                 ..
           cmake --build . --target tdjni -- -j$(nproc)
 
-      - name: Generate Java API (once, arch-independent, native host build)
+      - name: Generate Java API (arch-independent, arm64-v8a only)
         if: matrix.abi == 'arm64-v8a'
         working-directory: td/example/android
         run: |
-          # 关键修正: 生成 TdApi.java 的target叫 tl_generate_java，
-          # 定义在 example/android/CMakeLists.txt 的"非交叉编译"分支里，
-          # 不是 td 根目录的 td_generate_java_api（那个是给 example/java 用的、
-          # 依赖一套已装配的"td/bin"布局，跟我们的构建方式对不上）。
-          # 这里必须原生(host)构建 example/android 这个子项目本身，
-          # 它会自己 add_subdirectory(td) 把整个TDLib也编一遍(仅host态)。
           mkdir -p build-java-native
           cd build-java-native
           cmake -DCMAKE_BUILD_TYPE=Release -GNinja ..
           cmake --build . --target tl_generate_java -- -j$(nproc)
-          echo "---- 生成结果 ----"
+          echo "---- generated Java files ----"
           ls -la ../org/drinkless/tdlib/
           mkdir -p ../../../../java-out/org/drinkless/tdlib
           cp ../org/drinkless/tdlib/TdApi.java ../../../../java-out/org/drinkless/tdlib/
           cp ../../java/org/drinkless/tdlib/Client.java ../../../../java-out/org/drinkless/tdlib/
 
-      - name: Collect .so
+      - name: Collect libtdjni.so
         run: |
           mkdir -p out/jniLibs/${{ matrix.abi }}
-          find td/example/android/build-${{ matrix.abi }} -name "libtdjni.so" -exec cp {} out/jniLibs/${{ matrix.abi }}/ \;
+          find td/example/android/build-${{ matrix.abi }} -name "libtdjni.so" \
+               -exec cp {} out/jniLibs/${{ matrix.abi }}/ \;
 
       - uses: actions/upload-artifact@v4
         with:
@@ -158,31 +207,79 @@ jobs:
           name: tdlib-java-api
           path: java-out
 
-  package:
-    needs: build
+  # ─────────────────────────────────────────────
+  # 打包 + 创建 GitHub Release 并上传产物
+  # ─────────────────────────────────────────────
+  release:
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 允许创建 Release / 上传 asset
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Assemble tdlib-android.zip
+      - name: Show downloaded artifacts
+        run: find artifacts -type f | sort
+
+      - name: Assemble ${{ needs.prepare.outputs.zip_name }}
         run: |
+          ZIP_NAME="${{ needs.prepare.outputs.zip_name }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+
           mkdir -p dist/jniLibs dist/java
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
             mkdir -p dist/jniLibs/$abi
             cp artifacts/tdlib-$abi/libtdjni.so dist/jniLibs/$abi/ || true
           done
-          cp -r artifacts/tdlib-java-api/* dist/java/
-          cd dist && zip -r ../tdlib-android.zip jniLibs java
+          cp -r artifacts/tdlib-java-api/* dist/java/ || true
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tdlib-android
-          path: tdlib-android.zip
+          # 写入版本信息文件
+          cat > dist/VERSION.txt << EOF
+          TDLib Android Build
+          Version  : ${VERSION}
+          TDLib ref: ${{ needs.prepare.outputs.tdlib_ref }}
+          Built at : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Commit   : ${{ github.sha }}
+          EOF
 
-      - name: Attach to release (if tag push)
-        if: startsWith(github.ref, 'refs/tags/')
+          cd dist && zip -r ../"${ZIP_NAME}" jniLibs java VERSION.txt
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "✅ Created ${ZIP_NAME} ($(du -sh ../${ZIP_NAME} | cut -f1))"
+
+      - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: tdlib-android.zip
+          tag_name:   ${{ needs.prepare.outputs.tag_name }}
+          name:       "TDLib Android ${{ needs.prepare.outputs.version }}"
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: false
+          body: |
+            ## TDLib Android Build — ${{ needs.prepare.outputs.version }}
+
+            | 字段 | 值 |
+            |------|-----|
+            | TDLib ref | `${{ needs.prepare.outputs.tdlib_ref }}` |
+            | NDK 版本 | `${{ env.ANDROID_NDK_VERSION }}` |
+            | OpenSSL  | `3.2.1 (static)` |
+            | Android minSdk | `21` |
+            | 构建时间 | `${{ github.run_id }}` |
+
+            ### 包含内容
+            ```
+            tdlib-android-${{ needs.prepare.outputs.version }}.zip
+            ├── jniLibs/
+            │   ├── arm64-v8a/libtdjni.so
+            │   ├── armeabi-v7a/libtdjni.so
+            │   ├── x86_64/libtdjni.so
+            │   └── x86/libtdjni.so
+            ├── java/org/drinkless/tdlib/
+            │   ├── TdApi.java
+            │   └── Client.java
+            └── VERSION.txt
+            ```
+
+            ### 使用方式
+            解压后将 `jniLibs/` 复制到 `app/src/main/`，将 `java/` 内容复制到对应源码目录即可。
+          files: ${{ needs.prepare.outputs.zip_name }}
