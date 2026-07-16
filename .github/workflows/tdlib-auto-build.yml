@@ -342,17 +342,44 @@ jobs:
       - name: Verify libtdjni.so (${{ matrix.abi }})
         run: |
           SO="out/jniLibs/${{ matrix.abi }}/libtdjni.so"
-          [ -s "$SO" ]           || { echo "❌ 文件不存在或为空"; exit 1; }
+
+          # 1. 文件存在且非空
+          [ -s "$SO" ] || { echo "❌ 文件不存在或为空"; exit 1; }
+          echo "✅ 文件存在 ($(du -sh $SO | cut -f1))"
+
+          # 2. 合法 ELF
           file "$SO" | grep -q "ELF" || { echo "❌ 非 ELF 文件"; exit 1; }
+          echo "✅ ELF 格式正确"
+
+          # 3. ABI 匹配
           case "${{ matrix.abi }}" in
-            arm64-v8a)   readelf -h "$SO" | grep -q "AArch64" || { echo "❌ ABI 不符"; exit 1; } ;;
-            armeabi-v7a) readelf -h "$SO" | grep -q "ARM"     || { echo "❌ ABI 不符"; exit 1; } ;;
-            x86_64)      readelf -h "$SO" | grep -q "X86-64"  || { echo "❌ ABI 不符"; exit 1; } ;;
-            x86)         readelf -h "$SO" | grep -qE "80386"  || { echo "❌ ABI 不符"; exit 1; } ;;
+            arm64-v8a)   readelf -h "$SO" | grep -q "AArch64" || { echo "❌ ABI 不符: 期望 AArch64"; exit 1; } ;;
+            armeabi-v7a) readelf -h "$SO" | grep -q "ARM"     || { echo "❌ ABI 不符: 期望 ARM";     exit 1; } ;;
+            x86_64)      readelf -h "$SO" | grep -q "X86-64"  || { echo "❌ ABI 不符: 期望 X86-64";  exit 1; } ;;
+            x86)         readelf -h "$SO" | grep -qE "80386"  || { echo "❌ ABI 不符: 期望 80386";   exit 1; } ;;
           esac
-          readelf -sW "$SO" | grep -q "Java_org_drinkless_tdlib" \
-            || { echo "❌ 缺少 JNI 导出符号"; exit 1; }
-          echo "✅ ${{ matrix.abi }} 验证通过 ($(du -sh $SO | cut -f1))"
+          echo "✅ ABI 匹配: ${{ matrix.abi }}"
+
+          # 4. JNI 符号检测：同时检查动态符号表和静态符号表，兼容 strip 程度不同的构建
+          JNI_FOUND=false
+          if readelf -sW "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
+            JNI_FOUND=true
+          elif readelf --dyn-syms "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
+            JNI_FOUND=true
+          elif nm -D "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
+            JNI_FOUND=true
+          fi
+
+          if [ "$JNI_FOUND" = "true" ]; then
+            echo "✅ JNI 导出符号存在"
+          else
+            echo "⚠️  未找到 Java_org_drinkless_tdlib 符号，打印所有导出符号供排查:"
+            readelf --dyn-syms "$SO" | grep "GLOBAL" | grep "FUNC" | head -20 || true
+            nm -D "$SO" 2>/dev/null | head -20 || true
+            echo "❌ 缺少 JNI 导出符号"; exit 1
+          fi
+
+          echo "✅ ${{ matrix.abi }} 验证全部通过"
 
       - uses: actions/upload-artifact@v4
         with:
