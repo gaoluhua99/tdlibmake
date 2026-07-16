@@ -1,0 +1,473 @@
+name: TDLib Auto Check & Build
+
+# 将版本检测和编译发布合并为单一流程：
+#
+#   check  ──► (有更新?) ──► prepare ──► build (4 ABI 并行)
+#                  │                        │
+#                  │ 无更新                  ├─ 成功 ──► release (打包发布)
+#                  ▼                        └─ 失败 ──► rollback (清理)
+#               跳过后续
+#
+# 触发方式:
+#   1. 定时: 每天 UTC 08:00 自动检测上游，有更新则编译
+#   2. 手动: workflow_dispatch，可指定 tdlib_ref / release_tag
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      tdlib_ref:
+        description: "tdlib/td commit SHA 或 tag（留空则自动检测最新）"
+        required: false
+        default: ""
+      release_tag:
+        description: "Release 版本号，如 v1.8.66（留空则自动从 CMakeLists.txt 读取）"
+        required: false
+        default: ""
+      force_build:
+        description: "强制编译（即使版本未变化）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      prerelease:
+        description: "标记为预发布版本？"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  ANDROID_NDK_VERSION: "r26d"
+  OPENSSL_VERSION: "3.2.1"
+  TDLIB_REPO: "tdlib/td"
+  TDLIB_BRANCH: "master"
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # JOB 1: 检测上游版本，决定是否需要编译
+  # ══════════════════════════════════════════════════════════════
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tdlib_ref:    ${{ steps.resolve.outputs.tdlib_ref }}
+      release_tag:  ${{ steps.resolve.outputs.release_tag }}
+      zip_name:     ${{ steps.resolve.outputs.zip_name }}
+      prerelease:   ${{ steps.resolve.outputs.prerelease }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve versions & decide whether to build
+        id: resolve
+        run: |
+          # ── 1. 读取上游最新 SHA + 版本号 ──────────────────────────
+          echo "Fetching upstream tdlib/td master..."
+          UPSTREAM_SHA=$(git ls-remote https://github.com/${{ env.TDLIB_REPO }}.git \
+            refs/heads/${{ env.TDLIB_BRANCH }} | cut -f1)
+
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "ERROR: Failed to fetch upstream SHA"
+            exit 1
+          fi
+
+          CMAKE_URL="https://raw.githubusercontent.com/${{ env.TDLIB_REPO }}/${UPSTREAM_SHA}/CMakeLists.txt"
+          UPSTREAM_VER=$(curl -fsSL "$CMAKE_URL" \
+            | grep -oP 'project\s*\(\s*TDLib\s+VERSION\s+\K[0-9]+\.[0-9]+\.[0-9]+')
+
+          if [ -z "$UPSTREAM_VER" ]; then
+            echo "ERROR: Could not extract version from CMakeLists.txt"
+            exit 1
+          fi
+
+          echo "Upstream: v${UPSTREAM_VER} (${UPSTREAM_SHA:0:7})"
+
+          # ── 2. 读取本仓库当前版本 ──────────────────────────────────
+          if [ -f "tdlib.version" ]; then
+            CURRENT_SHA=$(cat tdlib.version | tr -d '\r' | awk '{print $1}')
+            CURRENT_VER=$(cat tdlib.version | tr -d '\r' | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+          else
+            CURRENT_SHA=""
+            CURRENT_VER=""
+          fi
+          echo "Current : v${CURRENT_VER:-unknown} (${CURRENT_SHA:0:7})"
+
+          # ── 3. 确定最终使用的 tdlib_ref ───────────────────────────
+          MANUAL_REF="${{ github.event.inputs.tdlib_ref }}"
+          if [ -n "$MANUAL_REF" ]; then
+            TDLIB_REF="$MANUAL_REF"
+            echo "Using manually specified tdlib_ref: ${TDLIB_REF}"
+          else
+            TDLIB_REF="$UPSTREAM_SHA"
+          fi
+
+          # ── 4. 确定 release_tag ────────────────────────────────────
+          MANUAL_TAG="${{ github.event.inputs.release_tag }}"
+          if [ -n "$MANUAL_TAG" ]; then
+            RELEASE_TAG="$MANUAL_TAG"
+          else
+            RELEASE_TAG="v${UPSTREAM_VER}"
+          fi
+
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          PRERELEASE="${PRERELEASE:-false}"
+
+          # ── 5. 判断是否需要编译 ────────────────────────────────────
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "$UPSTREAM_SHA" != "$CURRENT_SHA" ] || [ "$FORCE" = "true" ]; then
+            SHOULD_BUILD="true"
+            if [ "$FORCE" = "true" ] && [ "$UPSTREAM_SHA" = "$CURRENT_SHA" ]; then
+              echo "Force build enabled, rebuilding v${UPSTREAM_VER}"
+            else
+              echo "New version detected: v${CURRENT_VER:-unknown} -> v${UPSTREAM_VER}"
+            fi
+          else
+            SHOULD_BUILD="false"
+            echo "Already up to date: v${CURRENT_VER} — skipping build"
+          fi
+
+          ZIP_NAME="tdlib-android-${RELEASE_TAG}.zip"
+
+          # ── 6. 输出所有变量 ────────────────────────────────────────
+          echo "tdlib_ref=${TDLIB_REF}"       >> $GITHUB_OUTPUT
+          echo "release_tag=${RELEASE_TAG}"   >> $GITHUB_OUTPUT
+          echo "zip_name=${ZIP_NAME}"         >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}"     >> $GITHUB_OUTPUT
+          echo "should_build=${SHOULD_BUILD}" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "════════════════════════════════════"
+          echo "  tdlib ref   : ${TDLIB_REF:0:7}"
+          echo "  release tag : ${RELEASE_TAG}"
+          echo "  should build: ${SHOULD_BUILD}"
+          echo "════════════════════════════════════"
+
+      # 有新版本时更新 tdlib.version 文件（仅记录，不触发编译）
+      - name: Update tdlib.version
+        if: steps.resolve.outputs.should_build == 'true'
+        run: |
+          TDLIB_REF="${{ steps.resolve.outputs.tdlib_ref }}"
+          RELEASE_TAG="${{ steps.resolve.outputs.release_tag }}"
+          VER="${RELEASE_TAG#v}"
+
+          NEW_LINE="${TDLIB_REF} # ${RELEASE_TAG}"
+          CURRENT_LINE=$(cat tdlib.version 2>/dev/null | tr -d '\r' || true)
+
+          if [ "$NEW_LINE" != "$CURRENT_LINE" ]; then
+            git remote set-url origin \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            echo "$NEW_LINE" > tdlib.version
+            git add tdlib.version
+            git commit -m "chore: bump tdlib to ${RELEASE_TAG}"
+            git push origin main
+            echo "tdlib.version updated to: $NEW_LINE"
+          else
+            echo "tdlib.version already up to date"
+          fi
+
+      - name: Post check summary
+        if: always()
+        run: |
+          SHOULD_BUILD="${{ steps.resolve.outputs.should_build }}"
+          RELEASE_TAG="${{ steps.resolve.outputs.release_tag }}"
+          TDLIB_REF="${{ steps.resolve.outputs.tdlib_ref }}"
+
+          {
+            echo "## TDLib Check"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Release tag | \`${RELEASE_TAG}\` |"
+            echo "| tdlib ref   | \`${TDLIB_REF:0:7}\` |"
+            if [ "$SHOULD_BUILD" = "true" ]; then
+              echo "| Status | New version — building now |"
+            else
+              echo "| Status | Already up to date — skipped |"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 2: 并行编译各 ABI（仅当 check 判定需要时运行）
+  # ══════════════════════════════════════════════════════════════
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache ninja-build \
+            zlib1g-dev libssl-dev gperf php-cli binutils
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.abi }}-${{ needs.check.outputs.tdlib_ref }}
+          restore-keys: ccache-${{ matrix.abi }}-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=2G
+          ccache --zero-stats
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Setup Android NDK ${{ env.ANDROID_NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Checkout tdlib/td @ ${{ needs.check.outputs.tdlib_ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/td
+          ref: ${{ needs.check.outputs.tdlib_ref }}
+          path: td
+
+      - name: Pre-generate TDLib source files
+        working-directory: td
+        run: |
+          mkdir -p build-pregenerate && cd build-pregenerate
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DTD_GENERATE_SOURCE_FILES=ON \
+                -DTD_ENABLE_JNI=ON \
+                -GNinja ..
+          cmake --build . -- -j$(nproc)
+
+      - name: Map ABI → OpenSSL target
+        id: openssl_meta
+        run: |
+          case "${{ matrix.abi }}" in
+            arm64-v8a)   echo "target=android-arm64"  >> $GITHUB_OUTPUT ;;
+            armeabi-v7a) echo "target=android-arm"    >> $GITHUB_OUTPUT ;;
+            x86_64)      echo "target=android-x86_64" >> $GITHUB_OUTPUT ;;
+            x86)         echo "target=android-x86"    >> $GITHUB_OUTPUT ;;
+          esac
+          echo "install_dir=$GITHUB_WORKSPACE/openssl-install/${{ matrix.abi }}" >> $GITHUB_OUTPUT
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl-install/${{ matrix.abi }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-ndk${{ env.ANDROID_NDK_VERSION }}-${{ matrix.abi }}
+
+      - name: Build static OpenSSL for ${{ matrix.abi }}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          curl -fLO https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz
+          echo "83049d042a260e696f62406ac5c08bf706fd84383f945cf21bd61e9ed95c396e  openssl-${{ env.OPENSSL_VERSION }}.tar.gz" | sha256sum -c -
+          tar xf openssl-${{ env.OPENSSL_VERSION }}.tar.gz && cd openssl-${{ env.OPENSSL_VERSION }}
+          TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          ./Configure ${{ steps.openssl_meta.outputs.target }} \
+              -D__ANDROID_API__=21 no-shared no-tests \
+              --prefix=${{ steps.openssl_meta.outputs.install_dir }}
+          make -j$(nproc) && make install_sw
+
+      - name: Build libtdjni.so (${{ matrix.abi }})
+        working-directory: td/example/android
+        run: |
+          mkdir -p build-${{ matrix.abi }} && cd build-${{ matrix.abi }}
+          OSSL=${{ steps.openssl_meta.outputs.install_dir }}
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=${{ matrix.abi }} \
+                -DANDROID_PLATFORM=android-21 \
+                -DTD_ENABLE_JNI=ON \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+                -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+                -DOPENSSL_ROOT_DIR=$OSSL \
+                -DOPENSSL_INCLUDE_DIR=$OSSL/include \
+                -DOPENSSL_CRYPTO_LIBRARY=$OSSL/lib/libcrypto.a \
+                -DOPENSSL_SSL_LIBRARY=$OSSL/lib/libssl.a \
+                -DOPENSSL_USE_STATIC_LIBS=TRUE \
+                -GNinja ..
+          cmake --build . --target tdjni -- -j$(nproc)
+
+      - name: Print ccache stats
+        run: ccache --show-stats
+
+      - name: Generate Java API (arm64-v8a only)
+        if: matrix.abi == 'arm64-v8a'
+        working-directory: td/example/android
+        run: |
+          mkdir -p build-java-native && cd build-java-native
+          cmake -DCMAKE_BUILD_TYPE=Release -GNinja ..
+          cmake --build . --target tl_generate_java -- -j$(nproc)
+          mkdir -p ../../../../java-out/org/drinkless/tdlib
+          cp ../org/drinkless/tdlib/TdApi.java  ../../../../java-out/org/drinkless/tdlib/
+          cp ../../java/org/drinkless/tdlib/Client.java ../../../../java-out/org/drinkless/tdlib/
+
+      - name: Collect libtdjni.so
+        run: |
+          mkdir -p out/jniLibs/${{ matrix.abi }}
+          find td/example/android/build-${{ matrix.abi }} -name "libtdjni.so" \
+               -exec cp {} out/jniLibs/${{ matrix.abi }}/ \;
+
+      - name: Verify libtdjni.so (${{ matrix.abi }})
+        run: |
+          SO="out/jniLibs/${{ matrix.abi }}/libtdjni.so"
+          [ -s "$SO" ]           || { echo "❌ 文件不存在或为空"; exit 1; }
+          file "$SO" | grep -q "ELF" || { echo "❌ 非 ELF 文件"; exit 1; }
+          case "${{ matrix.abi }}" in
+            arm64-v8a)   readelf -h "$SO" | grep -q "AArch64" || { echo "❌ ABI 不符"; exit 1; } ;;
+            armeabi-v7a) readelf -h "$SO" | grep -q "ARM"     || { echo "❌ ABI 不符"; exit 1; } ;;
+            x86_64)      readelf -h "$SO" | grep -q "X86-64"  || { echo "❌ ABI 不符"; exit 1; } ;;
+            x86)         readelf -h "$SO" | grep -qE "80386"  || { echo "❌ ABI 不符"; exit 1; } ;;
+          esac
+          readelf -sW "$SO" | grep -q "Java_org_drinkless_tdlib" \
+            || { echo "❌ 缺少 JNI 导出符号"; exit 1; }
+          echo "✅ ${{ matrix.abi }} 验证通过 ($(du -sh $SO | cut -f1))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-${{ matrix.abi }}
+          path: out/jniLibs/${{ matrix.abi }}/libtdjni.so
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.abi == 'arm64-v8a'
+        with:
+          name: tdlib-java-api
+          path: java-out
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 3: 失败回滚
+  # ══════════════════════════════════════════════════════════════
+  rollback:
+    needs: [check, build]
+    if: failure() && needs.build.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Cleanup tag and Release on failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.check.outputs.release_tag }}"
+
+          # 删除远端 tag
+          gh api --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/git/refs/tags/${TAG} 2>/dev/null \
+            && echo "Deleted tag: ${TAG}" || echo "Tag not found: ${TAG}"
+
+          # 删除 Release
+          RELEASE_ID=$(gh api /repos/${{ github.repository }}/releases \
+            --jq ".[] | select(.tag_name==\"${TAG}\") | .id" 2>/dev/null || true)
+          if [ -n "$RELEASE_ID" ]; then
+            gh api --method DELETE \
+              /repos/${{ github.repository }}/releases/${RELEASE_ID} \
+              && echo "Deleted Release: ${RELEASE_ID}"
+          fi
+
+          {
+            echo "## ❌ Build Failed — Rolled Back"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Action | Tag and Release deleted (if existed) |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 4: 打包 + 发布 Release
+  # ══════════════════════════════════════════════════════════════
+  release:
+    needs: [check, build]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble ${{ needs.check.outputs.zip_name }}
+        run: |
+          ZIP_NAME="${{ needs.check.outputs.zip_name }}"
+          RELEASE_TAG="${{ needs.check.outputs.release_tag }}"
+          TDLIB_REF="${{ needs.check.outputs.tdlib_ref }}"
+
+          mkdir -p dist/jniLibs dist/java
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            mkdir -p dist/jniLibs/$abi
+            cp artifacts/tdlib-$abi/libtdjni.so dist/jniLibs/$abi/
+          done
+          cp -r artifacts/tdlib-java-api/* dist/java/
+
+          cat > dist/VERSION.txt << EOF
+          TDLib Android Build
+          Release  : ${RELEASE_TAG}
+          TDLib ref: ${TDLIB_REF}
+          NDK      : ${{ env.ANDROID_NDK_VERSION }}
+          OpenSSL  : ${{ env.OPENSSL_VERSION }} (static)
+          Built at : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Run ID   : ${{ github.run_id }}
+          EOF
+
+          cd dist && zip -r ../"${ZIP_NAME}" jniLibs java VERSION.txt
+          echo "ZIP_SIZE=$(du -sh ../${ZIP_NAME} | cut -f1)" >> $GITHUB_ENV
+          echo "Created: ${ZIP_NAME}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ needs.check.outputs.release_tag }}
+          name:       "TDLib Android ${{ needs.check.outputs.release_tag }}"
+          prerelease: ${{ needs.check.outputs.prerelease == 'true' }}
+          generate_release_notes: false
+          body: |
+            ## TDLib Android — ${{ needs.check.outputs.release_tag }}
+
+            | 字段 | 值 |
+            |---|---|
+            | tdlib/td ref  | `${{ needs.check.outputs.tdlib_ref }}` |
+            | Android NDK   | `${{ env.ANDROID_NDK_VERSION }}` |
+            | OpenSSL       | `${{ env.OPENSSL_VERSION }} (静态链接)` |
+            | minSdkVersion | `21` |
+            | 包大小        | `${{ env.ZIP_SIZE }}` |
+
+            ### 包含内容
+            ```
+            ${{ needs.check.outputs.zip_name }}
+            ├── jniLibs/
+            │   ├── arm64-v8a/libtdjni.so
+            │   ├── armeabi-v7a/libtdjni.so
+            │   ├── x86_64/libtdjni.so
+            │   └── x86/libtdjni.so
+            ├── java/org/drinkless/tdlib/
+            │   ├── TdApi.java
+            │   └── Client.java
+            └── VERSION.txt
+            ```
+
+            ### 接入方式
+            解压后将 `jniLibs/` 复制到 `app/src/main/`，将 `java/` 内容合并到对应源码目录。
+          files: ${{ needs.check.outputs.zip_name }}
