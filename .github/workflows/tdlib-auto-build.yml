@@ -280,8 +280,14 @@ jobs:
           TARBALL="openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
           BASE_URL="https://www.openssl.org/source"
           curl -fLO "${BASE_URL}/${TARBALL}"
-          EXPECTED=$(curl -fsSL "${BASE_URL}/${TARBALL}.sha256")
-          echo "${EXPECTED}  ${TARBALL}" | sha256sum -c -
+          # 官网 .sha256 只含纯哈希值（无文件名），手动比对
+          EXPECTED=$(curl -fsSL "${BASE_URL}/${TARBALL}.sha256" | tr -d '[:space:]')
+          ACTUAL=$(sha256sum "${TARBALL}" | awk '{print $1}')
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "SHA256 mismatch: expected=${EXPECTED} actual=${ACTUAL}"
+            exit 1
+          fi
+          echo "SHA256 OK: ${ACTUAL}"
           tar xf "${TARBALL}" && cd openssl-${{ env.OPENSSL_VERSION }}
           TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
           export PATH="$TOOLCHAIN/bin:$PATH"
