@@ -44,7 +44,7 @@ on:
 
 env:
   ANDROID_NDK_VERSION: "r26d"
-  OPENSSL_VERSION: "3.2.1"
+  OPENSSL_VERSION: "3.5.1"   # 当前 LTS（支持至 2030-04-08），3.2.x 已 EOL
   TDLIB_REPO: "tdlib/td"
   TDLIB_BRANCH: "master"
 
@@ -277,9 +277,12 @@ jobs:
         env:
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          curl -fLO https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz
-          echo "83049d042a260e696f62406ac5c08bf706fd84383f945cf21bd61e9ed95c396e  openssl-${{ env.OPENSSL_VERSION }}.tar.gz" | sha256sum -c -
-          tar xf openssl-${{ env.OPENSSL_VERSION }}.tar.gz && cd openssl-${{ env.OPENSSL_VERSION }}
+          TARBALL="openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
+          BASE_URL="https://www.openssl.org/source"
+          curl -fLO "${BASE_URL}/${TARBALL}"
+          EXPECTED=$(curl -fsSL "${BASE_URL}/${TARBALL}.sha256")
+          echo "${EXPECTED}  ${TARBALL}" | sha256sum -c -
+          tar xf "${TARBALL}" && cd openssl-${{ env.OPENSSL_VERSION }}
           TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
           export PATH="$TOOLCHAIN/bin:$PATH"
           export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
