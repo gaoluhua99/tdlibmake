@@ -2,8 +2,10 @@ name: Check TDLib Upstream Updates
 
 # 跟踪 tdlib/td 的 CMakeLists.txt 中的 project(TDLib VERSION x.x.x)
 #
-# 发现新版本后直接 commit tdlib.version 到 main 分支，
-# 自动触发 build-tdlib.yml 开始编译，无需人工介入。
+# 发现新版本后：
+#   1. 直接 commit tdlib.version 到 main（保留更新记录）
+#   2. 通过 workflow_dispatch API 直接调用 build-tdlib.yml 开始编译
+#      （绕过 GitHub 限制：bot commit 的 push 不会触发其他 workflow）
 
 on:
   schedule:
@@ -12,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  actions: write    # 允许调用 gh workflow run 触发其他 workflow
 
 env:
   TDLIB_REPO: "tdlib/td"
@@ -50,7 +53,6 @@ jobs:
           echo "sha=${HEAD_SHA}"           >> $GITHUB_OUTPUT
           echo "sha_short=${HEAD_SHA:0:7}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}"         >> $GITHUB_OUTPUT
-
           echo "Upstream: v${VERSION} (${HEAD_SHA:0:7})"
 
       - name: Read current tdlib.version
@@ -79,7 +81,7 @@ jobs:
             echo "needs_update=true" >> $GITHUB_OUTPUT
           fi
 
-      # 直接 commit 到 main，跳过 PR，触发 build-tdlib.yml 自动编译
+      # Step 1: commit tdlib.version 到 main（更新版本记录）
       - name: Commit new tdlib.version to main
         if: steps.compare.outputs.needs_update == 'true'
         run: |
@@ -101,13 +103,30 @@ jobs:
           Latest  : v${LATEST_VER} (${LATEST_SHA:0:7})
 
           Source: tdlib/td master CMakeLists.txt
-          Diff: https://github.com/tdlib/td/compare/${CURRENT_SHA}...${LATEST_SHA}
-
-          Auto-committed by check-tdlib-update workflow.
-          Build will start automatically via build-tdlib.yml."
+          Diff: https://github.com/tdlib/td/compare/${CURRENT_SHA}...${LATEST_SHA}"
 
           git push origin main
-          echo "Committed v${LATEST_VER} to main — build triggered automatically"
+          echo "Committed v${LATEST_VER} to main"
+
+      # Step 2: 通过 API 直接触发 build-tdlib.yml
+      # gh workflow run 内部使用 workflow_dispatch API，不受 bot push 限制
+      - name: Trigger build-tdlib.yml
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_SHA="${{ steps.upstream.outputs.sha }}"
+          LATEST_VER="${{ steps.upstream.outputs.version }}"
+
+          echo "Dispatching build for v${LATEST_VER} (${LATEST_SHA:0:7})..."
+
+          gh workflow run build-tdlib.yml \
+            --ref main \
+            --field tdlib_ref="${LATEST_SHA}" \
+            --field release_tag="v${LATEST_VER}" \
+            --field prerelease="false"
+
+          echo "Build dispatched: v${LATEST_VER}"
 
       - name: Post summary
         if: always()
@@ -126,7 +145,7 @@ jobs:
             echo "| Current  | v${CURRENT_VER:-unknown} (\`${CURRENT_SHA:0:7}\`) |"
             echo "| Upstream | v${LATEST_VER} (\`${LATEST_SHA:0:7}\`) |"
             if [ "$NEEDS_UPDATE" = "true" ]; then
-              echo "| Status | New version — committed to main, build triggered |"
+              echo "| Status | New version — build dispatched |"
               echo "| Diff | [Compare](https://github.com/tdlib/td/compare/${CURRENT_SHA}...${LATEST_SHA}) |"
             else
               echo "| Status | Already up to date |"
