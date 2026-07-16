@@ -360,23 +360,13 @@ jobs:
           esac
           echo "✅ ABI 匹配: ${{ matrix.abi }}"
 
-          # 4. JNI 符号检测：同时检查动态符号表和静态符号表，兼容 strip 程度不同的构建
-          JNI_FOUND=false
-          if readelf -sW "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
-            JNI_FOUND=true
-          elif readelf --dyn-syms "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
-            JNI_FOUND=true
-          elif nm -D "$SO" 2>/dev/null | grep -q "Java_org_drinkless_tdlib"; then
-            JNI_FOUND=true
-          fi
-
-          if [ "$JNI_FOUND" = "true" ]; then
-            echo "✅ JNI 导出符号存在"
+          # 4. JNI 入口检测
+          # tdlib 使用动态注册（RegisterNatives），不会有 Java_* 前缀符号
+          # 只需确认 JNI_OnLoad 存在即可
+          if nm -D "$SO" 2>/dev/null | grep -q "JNI_OnLoad" ||              readelf --dyn-syms "$SO" 2>/dev/null | grep -q "JNI_OnLoad"; then
+            echo "✅ JNI_OnLoad 存在（动态注册模式）"
           else
-            echo "⚠️  未找到 Java_org_drinkless_tdlib 符号，打印所有导出符号供排查:"
-            readelf --dyn-syms "$SO" | grep "GLOBAL" | grep "FUNC" | head -20 || true
-            nm -D "$SO" 2>/dev/null | head -20 || true
-            echo "❌ 缺少 JNI 导出符号"; exit 1
+            echo "❌ 未找到 JNI_OnLoad，不是有效的 JNI 库"; exit 1
           fi
 
           echo "✅ ${{ matrix.abi }} 验证全部通过"
