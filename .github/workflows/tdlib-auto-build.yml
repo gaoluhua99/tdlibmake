@@ -281,7 +281,7 @@ jobs:
           BASE_URL="https://www.openssl.org/source"
           curl -fLO "${BASE_URL}/${TARBALL}"
           # 官网 .sha256 只含纯哈希值（无文件名），手动比对
-          EXPECTED=$(curl -fsSL "${BASE_URL}/${TARBALL}.sha256" | tr -d '[:space:]')
+          EXPECTED=$(curl -fsSL "${BASE_URL}/${TARBALL}.sha256" | awk '{print $1}' | cut -d'*' -f1 | tr -d '[:space:]')
           ACTUAL=$(sha256sum "${TARBALL}" | awk '{print $1}')
           if [ "$EXPECTED" != "$ACTUAL" ]; then
             echo "SHA256 mismatch: expected=${EXPECTED} actual=${ACTUAL}"
