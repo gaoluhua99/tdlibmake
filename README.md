@@ -1,119 +1,117 @@
-# TDLib Make for Android
+# tdlibmake
 
-使用 GitHub Actions 自动编译 [TDLib (Telegram Database Library)](https://github.com/tdlib/td) 的 Android JNI 库 (`libtdjni.so`)，并生成 Java API 绑定文件。
+自动追踪 [tdlib/td](https://github.com/tdlib/td) 上游版本，使用 GitHub Actions 编译 Android 所需的 `libtdjni.so`，并将产物打包发布到 Releases。无需本地环境，全程自动化。
 
-## 产物
+## 功能特性
 
-每次成功构建会生成 `tdlib-android-<版本号>.zip`，包含：
+- **自动追踪上游**：每天定时检查 tdlib/td 的 CMakeLists.txt，发现新版本自动触发编译
+- **四架构并行编译**：`arm64-v8a` / `armeabi-v7a` / `x86_64` / `x86` 同时构建，节省时间
+- **编译产物缓存**：OpenSSL 静态库和 ccache 均有缓存，二次构建大幅提速
+- **构建验证**：编译后自动校验 ELF 格式、ABI 匹配、JNI 入口符号完整性
+- **失败自动回滚**：任一 ABI 编译失败时自动删除已创建的 tag 和 Release，避免留下半成品
+- **版本号文件名**：产物以 `tdlib-android-v1.8.66.zip` 格式命名，版本一目了然
+
+## 产物结构
 
 ```
-tdlib-android-<版本号>.zip
+tdlib-android-v1.8.66.zip
 ├── jniLibs/
 │   ├── arm64-v8a/libtdjni.so
 │   ├── armeabi-v7a/libtdjni.so
 │   ├── x86_64/libtdjni.so
 │   └── x86/libtdjni.so
 ├── java/org/drinkless/tdlib/
-│   ├── TdApi.java
-│   └── Client.java
-└── VERSION.txt
+│   ├── TdApi.java        # 自动生成的 TDLib Java API
+│   └── Client.java       # TDLib Java 客户端
+└── VERSION.txt           # 构建信息（版本号、SHA、NDK、时间）
 ```
 
-- **4 个 ABI**：`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86`
-- **minSdkVersion**：21（Android 5.0+）
-- **OpenSSL**：3.2.1（静态链接）
-- **NDK**：r26d
+## 构建环境
 
-## 使用方法
+| 组件 | 版本 |
+|---|---|
+| Android NDK | r26d |
+| OpenSSL | 3.5.1（静态链接） |
+| minSdkVersion | 21 |
+| 运行环境 | ubuntu-latest |
 
-### 方式一：推送 Tag（推荐）
-
-适用于常规版本发布。
-
-1. 修改 `tdlib.version` 文件，写入要编译的 TDLib 上游 commit SHA 或 tag（例如 `a17f87c4cff7b90b278d12b91ba0614383aaee82` 或 `v1.8.0`）
-2. 提交并推送
-3. 创建并推送版本 tag（必须以 `v` 开头）：
-
-```bash
-git tag v1.8.65
-git push origin v1.8.65
-```
-
-GitHub Actions 会自动：
-- 从 `tdlib.version` 读取 TDLib 上游 ref
-- 编译 4 个 ABI 的 `libtdjni.so`
-- 生成 `TdApi.java` 和 `Client.java`
-- 打包为 `tdlib-android-v1.8.65.zip`
-- 创建 GitHub Release 并上传附件
-
-### 方式二：手动触发（Workflow Dispatch）
-
-适用于测试或自定义构建。
-
-1. 打开 GitHub 仓库页面 → **Actions** → **Build TDLib for Android** → **Run workflow**
-2. 填写参数：
-
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `tdlib_ref` | tdlib/td 上游的 commit SHA 或 tag | `a17f87c4cff7b90b278d12b91ba0614383aaee82` |
-| `release_tag` | 本次 Release 的版本号（留空自动生成） | `v1.8.65` |
-| `prerelease` | 是否标记为预发布 | `false` / `true` |
-
-## 接入 Android 项目
-
-将解压得到的文件集成到你的 Android 项目中：
-
-1. **jniLibs**：将 `jniLibs/` 目录复制到 `app/src/main/` 下
-2. **Java API**：将 `java/` 下的 `org.drinkless.tdlib` 包合并到 `app/src/main/java/` 目录
-
-最终项目结构：
+## 自动化流程
 
 ```
-app/src/main/
-├── jniLibs/
-│   ├── arm64-v8a/libtdjni.so
-│   ├── armeabi-v7a/libtdjni.so
-│   ├── x86_64/libtdjni.so
-│   └── x86/libtdjni.so
-└── java/
-    └── org/drinkless/tdlib/
-        ├── TdApi.java
-        └── Client.java
+每天 UTC 08:00
+    │
+    ▼
+  check：读取 tdlib/td master 的 CMakeLists.txt
+    ├─ 版本未变 → 跳过，结束
+    └─ 发现新版本
+        ├─ 更新 tdlib.version 并 commit 到 main
+        └─ 触发编译
+            │
+            ▼
+  build (4 ABI 并行)
+    ├─ 成功 → release：打包 zip，发布 GitHub Release
+    └─ 失败 → rollback：删除 tag 和 Release
 ```
 
-## 本地构建（可选）
+版本追踪依据 `tdlib/td` 仓库 `CMakeLists.txt` 中的 `project(TDLib VERSION x.x.x)`，当前已构建版本记录在仓库根目录的 [`tdlib.version`](./tdlib.version) 文件中。
 
-如果需要在本地编译，参考以下步骤（需安装 CMake、Ninja、Android NDK r26d）：
+## 手动触发编译
 
-```bash
-# 1. 克隆 TDLib
-git clone https://github.com/tdlib/td.git
-cd td
+在 [Actions → TDLib Auto Check & Build](../../actions/workflows/tdlib-auto-build.yml) 页面点击 **Run workflow**，支持以下参数：
 
-# 2. 预生成源码
-mkdir build-pregenerate && cd build-pregenerate
-cmake -DCMAKE_BUILD_TYPE=Release \
-      -DTD_GENERATE_SOURCE_FILES=ON \
-      -DTD_ENABLE_JNI=ON \
-      -GNinja ..
-cmake --build . -- -j$(nproc)
-cd ..
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `tdlib_ref` | tdlib/td 的 commit SHA 或 tag | 自动取最新 master |
+| `release_tag` | Release 版本号，如 `v1.8.66` | 自动从 CMakeLists.txt 读取 |
+| `force_build` | 强制编译（即使版本未变化） | `false` |
+| `prerelease` | 标记为预发布版本 | `false` |
 
-# 3. 交叉编译（以 arm64-v8a 为例）
-cd example/android
-mkdir build-arm64-v8a && cd build-arm64-v8a
-cmake -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-      -DANDROID_ABI=arm64-v8a \
-      -DANDROID_PLATFORM=android-21 \
-      -DTD_ENABLE_JNI=ON \
-      -GNinja ..
-cmake --build . --target tdjni -- -j$(nproc)
+## 在 Android 项目中接入
+
+从 [Releases](../../releases) 下载最新的 `tdlib-android-*.zip`，解压后：
+
+**1. 复制 .so 文件**
+
+将 `jniLibs/` 目录整体复制到 `app/src/main/`：
+
+```
+app/src/main/jniLibs/
+├── arm64-v8a/libtdjni.so
+├── armeabi-v7a/libtdjni.so
+├── x86_64/libtdjni.so
+└── x86/libtdjni.so
 ```
 
-## 项目文件说明
+**2. 复制 Java 源文件**
 
-| 文件 | 说明 |
-|------|------|
-| `.github/workflows/build-tdlib.yml` | GitHub Actions 工作流定义 |
-| `tdlib.version` | 指定要编译的 tdlib/td 上游 ref（commit SHA 或 tag） |
+将 `java/org/drinkless/tdlib/` 下的文件复制到你的源码目录：
+
+```
+app/src/main/java/org/drinkless/tdlib/
+├── TdApi.java
+└── Client.java
+```
+
+**3. 加载库**
+
+在应用启动时加载：
+
+```java
+System.loadLibrary("tdjni");
+```
+
+之后即可使用 `TdApi` 和 `Client` 进行 TDLib 开发。更多用法参考 [tdlib 官方文档](https://core.telegram.org/tdlib)。
+
+## 仓库设置要求
+
+首次 fork 或使用时需确认以下设置：
+
+**Settings → Actions → General**
+- Workflow permissions → 选择 **Read and write permissions**
+- 勾选 **Allow GitHub Actions to create and approve pull requests**
+
+## 相关链接
+
+- [tdlib/td](https://github.com/tdlib/td) — TDLib 官方仓库
+- [TDLib 官方文档](https://core.telegram.org/tdlib) — API 文档
+- [TGX-Android/tdlib](https://github.com/TGX-Android/tdlib) — Telegram X 的 tdlib 构建参考
